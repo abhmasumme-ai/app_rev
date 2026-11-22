@@ -1,18 +1,23 @@
 """
 main.py (desktop) — thin proxy to relay server.
 - Serves index.html/css/js locally
-- /ws → relay?role=panel (transparent pipe)
+- /ws → relay?role=panel (transparent pipe, auto-reconnect)
 - /api/* → relay with Bearer user_key
 """
 import asyncio
 import json
+import logging
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
 import websockets
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
+
+log = logging.getLogger("proxy")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -32,9 +37,31 @@ CFG = _read_cfg()
 RELAY_HTTP = (CFG.get("relay_url") or "").replace("wss://", "https://").replace("ws://", "http://").rstrip("/")
 RELAY_WS = (CFG.get("relay_url") or "").rstrip("/")
 USER_KEY = CFG.get("user_key") or ""
+LOCAL_PORT = int(CFG.get("local_port", 5000))
 
-app = FastAPI()
+CONN_QUEUE_SIZE = 500
+RECONNECT_MAX_S = 30
+WS_PING_INTERVAL = 20
+WS_PING_TIMEOUT = 20
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    log.info("local=%s relay=%s key_set=%s",
+             LOCAL_PORT, RELAY_WS or "(none)", bool(USER_KEY))
+    yield
+    await _http.aclose()
+
+
+app = FastAPI(lifespan=lifespan)
 _http = httpx.AsyncClient(timeout=15)
+
+
+# ═══════════════════════════════════════════════════════════
+#  REST proxies
+# ═══════════════════════════════════════════════════════════
+def _hdr():
+    return {"Authorization": f"Bearer {USER_KEY}"}
 
 
 @app.get("/api/matches")
@@ -42,8 +69,7 @@ async def api_matches():
     if not RELAY_HTTP or not USER_KEY:
         return JSONResponse({"status": "ok", "data": {"matches": []}}, status_code=200)
     try:
-        r = await _http.get(f"{RELAY_HTTP}/api/matches",
-                            headers={"Authorization": f"Bearer {USER_KEY}"})
+        r = await _http.get(f"{RELAY_HTTP}/api/matches", headers=_hdr())
         return JSONResponse(r.json(), status_code=r.status_code)
     except Exception as e:
         return JSONResponse({"status": "error", "message": str(e)}, status_code=200)
@@ -54,8 +80,7 @@ async def api_match(key: str):
     if not RELAY_HTTP or not USER_KEY:
         return JSONResponse({"status": "error", "message": "not configured"}, status_code=503)
     try:
-        r = await _http.get(f"{RELAY_HTTP}/api/match/{key}",
-                            headers={"Authorization": f"Bearer {USER_KEY}"})
+        r = await _http.get(f"{RELAY_HTTP}/api/match/{key}", headers=_hdr())
         return JSONResponse(r.json(), status_code=r.status_code)
     except Exception as e:
         return JSONResponse({"status": "error", "message": str(e)}, status_code=503)
@@ -67,46 +92,108 @@ async def api_click(req: Request):
         body = await req.json()
     except Exception:
         body = {}
-    if RELAY_HTTP and USER_KEY:
-        try:
-            await _http.post(f"{RELAY_HTTP}/api/click",
-                             headers={"Authorization": f"Bearer {USER_KEY}"},
-                             json=body)
-        except Exception:
-            pass
-    return {"status": "ok"}
+    if not (RELAY_HTTP and USER_KEY):
+        return JSONResponse({"status": "error", "message": "not configured"}, status_code=503)
+    try:
+        r = await _http.post(f"{RELAY_HTTP}/api/click", headers=_hdr(), json=body)
+        return JSONResponse(r.json(), status_code=r.status_code)
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=502)
 
 
+# ═══════════════════════════════════════════════════════════
+#  WS proxy with auto-reconnect
+# ═══════════════════════════════════════════════════════════
 @app.websocket("/ws")
 async def ws_proxy(ws: WebSocket):
-    """Transparent pipe panel ↔ relay."""
     await ws.accept()
     role = ws.query_params.get("role", "panel")
     if not RELAY_WS or not USER_KEY:
         await ws.close(code=1011, reason="relay not configured")
         return
+
     url = f"{RELAY_WS}?token={USER_KEY}&role={role}"
 
-    try:
-        async with websockets.connect(url, ping_interval=None, max_size=None) as up:
-            async def c2s():
-                try:
-                    async for msg in ws.iter_text():
-                        await up.send(msg)
-                except Exception:
-                    pass
+    to_relay: asyncio.Queue[str] = asyncio.Queue(maxsize=CONN_QUEUE_SIZE)
+    client_gone = asyncio.Event()
+    last_watch = {"msg": None}
 
-            async def s2c():
-                try:
-                    async for msg in up:
+    async def client_reader():
+        try:
+            async for msg in ws.iter_text():
+                if msg.startswith("watch:"):
+                    last_watch["msg"] = msg
+                await to_relay.put(msg)
+        except Exception:
+            pass
+        finally:
+            client_gone.set()
+
+    async def relay_loop():
+        backoff = 1
+        while not client_gone.is_set():
+            try:
+                async with websockets.connect(
+                    url,
+                    ping_interval=WS_PING_INTERVAL,
+                    ping_timeout=WS_PING_TIMEOUT,
+                    max_size=None,
+                ) as up:
+                    backoff = 1
+                    log.info("relay connected (role=%s)", role)
+
+                    # restore last watch on a fresh connection
+                    if to_relay.empty() and last_watch["msg"]:
                         try:
-                            await ws.send_text(msg if isinstance(msg, str) else msg.decode())
+                            await up.send(last_watch["msg"])
                         except Exception:
-                            return
-                except Exception:
-                    pass
+                            pass
 
-            await asyncio.gather(c2s(), s2c(), return_exceptions=True)
+                    async def sender():
+                        while True:
+                            msg = await to_relay.get()
+                            try:
+                                await up.send(msg)
+                            except Exception:
+                                try:
+                                    to_relay.put_nowait(msg)
+                                except asyncio.QueueFull:
+                                    pass
+                                raise
+
+                    async def receiver():
+                        async for msg in up:
+                            txt = msg if isinstance(msg, str) else msg.decode()
+                            try:
+                                await ws.send_text(txt)
+                            except Exception:
+                                return
+
+                    tasks = [
+                        asyncio.create_task(sender()),
+                        asyncio.create_task(receiver()),
+                        asyncio.create_task(client_gone.wait()),
+                    ]
+                    done, pending = await asyncio.wait(
+                        tasks, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for p in pending:
+                        p.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+                    if client_gone.is_set():
+                        return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning("relay conn error: %r", e)
+
+            if client_gone.is_set():
+                return
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, RECONNECT_MAX_S)
+
+    try:
+        await asyncio.gather(client_reader(), relay_loop())
     except Exception:
         pass
     finally:
@@ -116,6 +203,9 @@ async def ws_proxy(ws: WebSocket):
             pass
 
 
+# ═══════════════════════════════════════════════════════════
+#  Static files
+# ═══════════════════════════════════════════════════════════
 def _file(name: str):
     f = BASE_DIR / name
     if not f.exists():
@@ -150,10 +240,11 @@ async def health():
         "relay_configured": bool(RELAY_HTTP and USER_KEY),
         "relay_url": RELAY_HTTP or None,
         "user_key_set": bool(USER_KEY),
+        "local_port": LOCAL_PORT,
     }
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="127.0.0.1", port=5000,
+    uvicorn.run("main:app", host="127.0.0.1", port=LOCAL_PORT,
                 access_log=False, log_level="warning")
