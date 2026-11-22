@@ -7,22 +7,16 @@ Architecture:
                         │                                    ├─ panel(s)
                         │                                    └─ clicker
     Auth: every WS/REST request carries `token=usr_xxx` (user license key)
-
-Runs on VPS behind nginx/caddy TLS. Clients connect to:
-    wss://relay.yourdomain.com/relay?token=usr_xxx&role=panel
-    wss://relay.yourdomain.com/relay?token=usr_xxx&role=clicker
-    https://relay.yourdomain.com/api/matches       (Bearer usr_xxx)
-    https://relay.yourdomain.com/api/match/{key}   (Bearer usr_xxx)
-    https://relay.yourdomain.com/api/click         (Bearer usr_xxx, POST)
 """
 import asyncio
 import gzip
+import hashlib
 import json
 import logging
 import os
 import re
 import time
-import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -86,6 +80,7 @@ MAX_CACHE = 500
 CACHE_FRESH_MS = 60_000
 REST_REFRESH_S = 25
 CONN_QUEUE_SIZE = 500
+MAX_DISPATCH_TASKS = 1000
 
 # ═══════════════════════════════════════════════════════════
 #  USER DB
@@ -114,6 +109,14 @@ def check_user_key(key: str) -> bool:
     exp = u.get("expires")
     if exp and exp < time.time():
         return False
+    # optional hashed key: {"key_hash": "sha256:<hex>"}
+    kh = u.get("key_hash")
+    if kh:
+        algo, _, digest = kh.partition(":")
+        if algo != "sha256":
+            return False
+        if hashlib.sha256(key.encode("utf-8")).hexdigest() != digest.strip().lower():
+            return False
     return True
 
 
@@ -123,9 +126,11 @@ def check_user_key(key: str) -> bool:
 client = httpx.AsyncClient(timeout=15)
 
 UP = {"connected": False, "msgs": 0, "last": 0.0}
-LATEST_OBJ: dict[str, dict] = {}
-FIX: dict[str, dict] = {}
+
+LATEST_OBJ: "OrderedDict[str, dict]" = OrderedDict()
+FIX: "OrderedDict[str, dict]" = OrderedDict()
 _fix_pending: set[str] = set()
+_dispatch_tasks: set[asyncio.Task] = set()
 
 _rest = {
     "ts": 0.0, "rows": [], "last_error": "",
@@ -133,8 +138,33 @@ _rest = {
 }
 _rest_lock = asyncio.Lock()
 
+
+def _lr_put(store: "OrderedDict[str, dict]", key: str, val: dict):
+    store[key] = val
+    store.move_to_end(key)
+    while len(store) > MAX_CACHE:
+        store.popitem(last=False)
+
+
+def _lr_get(store: "OrderedDict[str, dict]", key: str):
+    v = store.get(key)
+    if v is not None:
+        store.move_to_end(key)
+    return v
+
+
+def _schedule(coro_fn, *args):
+    """Bounded background task dispatch."""
+    if len(_dispatch_tasks) >= MAX_DISPATCH_TASKS:
+        log.debug("dispatch backlog full, dropping")
+        return
+    t = asyncio.create_task(coro_fn(*args))
+    _dispatch_tasks.add(t)
+    t.add_done_callback(_dispatch_tasks.discard)
+
+
 # ═══════════════════════════════════════════════════════════
-#  HELPERS (from your original main.py)
+#  HELPERS
 # ═══════════════════════════════════════════════════════════
 def _i(v, d=0):
     try:
@@ -289,9 +319,10 @@ async def _do_rest_fetch():
         _rest["refreshing"] = True
         try:
             parts = await asyncio.gather(
-                _fetch_status(3, 50),
-                _fetch_status(1, 50),
-                _fetch_status(2, 50),
+                _fetch_status(3, 50),   # started
+                _fetch_status(1, 50),   # not started
+                _fetch_status(2, 50),   # completed
+                _fetch_status(4, 20),   # cancelled
             )
             errors = [p["error"] for p in parts if p["error"]]
             merged: dict[str, dict] = {}
@@ -331,18 +362,16 @@ async def _fixture_refresh_loop():
 
 
 # ═══════════════════════════════════════════════════════════
-#  FIX (push fallback metadata)
+#  FIX (push fallback metadata) — LRU
 # ═══════════════════════════════════════════════════════════
 def _create_stub_fix(mid: str):
     if mid in FIX:
         return
-    FIX[mid] = {
+    _lr_put(FIX, mid, {
         "key": mid, "title": f"Match {mid}", "format": "",
         "status": "started", "start_at": None,
         "teams": {"a": {}, "b": {}},
-    }
-    if len(FIX) > MAX_CACHE:
-        FIX.pop(next(iter(FIX)), None)
+    })
 
 
 async def _fetch_fix_metadata(mid: str):
@@ -350,17 +379,14 @@ async def _fetch_fix_metadata(mid: str):
         if not REST_TOKEN:
             _create_stub_fix(mid)
             return
-        r = await client.get(
-            f"{REST_BASE}/matches/{mid}/info",
-            params={"token": REST_TOKEN},
-        )
+        r = await client.get(f"{REST_BASE}/matches/{mid}/info", params={"token": REST_TOKEN})
         if not r.is_success:
             _create_stub_fix(mid)
             return
         resp = r.json().get("response") or {}
         mi = resp.get("match_info") if isinstance(resp.get("match_info"), dict) else resp
         if isinstance(mi, dict) and mi.get("match_id"):
-            FIX[mid] = fixture_row(mi)
+            _lr_put(FIX, mid, fixture_row(mi))
             log.info("FIX populated via REST: %s → %s", mid, FIX[mid].get("title"))
         else:
             _create_stub_fix(mid)
@@ -377,42 +403,30 @@ def _ensure_fix(mid: str):
     if REST_TOKEN:
         if mid not in _fix_pending:
             _fix_pending.add(mid)
-            asyncio.create_task(_fetch_fix_metadata(mid))
+            _schedule(_fetch_fix_metadata, mid)
         return
     _create_stub_fix(mid)
 
 
 # ═══════════════════════════════════════════════════════════
-#  PER-USER SESSIONS
+#  PER-USER SESSIONS  (per-panel independent watch)
 # ═══════════════════════════════════════════════════════════
 class UserSession:
     def __init__(self, user_key: str):
         self.user_key = user_key
-        self.panels: set[WebSocket] = set()
+        # panel websocket -> currently watched match key ("" = none)
+        self.panels: dict[WebSocket, str] = {}
         self.clicker: WebSocket | None = None
-        self.watching: str = ""
+        self.clicker_watch: str = ""
 
-    def to_panels(self, data: dict) -> list[str]:
-        return [_dumps(data)]
+    def panel_targets(self, mid: str) -> list[WebSocket]:
+        return [ws for ws, w in self.panels.items() if w == mid]
 
-    async def send_to_panels(self, data: dict):
-        if not self.panels:
-            return
-        txt = _dumps(data)
-        dead = []
-        for p in list(self.panels):
-            try:
-                await p.send_text(txt)
-            except Exception:
-                dead.append(p)
-        for p in dead:
-            self.panels.discard(p)
-
-    async def send_to_clicker(self, data: dict):
+    async def send_to_clicker(self, txt: str):
         if self.clicker is None:
             return
         try:
-            await self.clicker.send_text(_dumps(data))
+            await self.clicker.send_text(txt)
         except Exception:
             pass
 
@@ -428,30 +442,47 @@ def _session(user_key: str) -> UserSession:
     return s
 
 
-def _watching_users(mid: str) -> list[UserSession]:
-    return [s for s in _sessions.values() if s.watching == mid]
+# ═══════════════════════════════════════════════════════════
+#  DISPATCH
+# ═══════════════════════════════════════════════════════════
+async def _dispatch_event(mid: str, out: dict):
+    txt = _dumps(out)
+    for sess in _sessions.values():
+        if sess.clicker is not None and sess.clicker_watch == mid:
+            try:
+                await sess.clicker.send_text(txt)
+            except Exception:
+                pass
+        targets = sess.panel_targets(mid)
+        dead = []
+        for p in targets:
+            try:
+                await p.send_text(txt)
+            except Exception:
+                dead.append(p)
+        for p in dead:
+            sess.panels.pop(p, None)
+
+
+async def _dispatch_match(mid: str, out: dict):
+    txt = _dumps(out)
+    for sess in _sessions.values():
+        targets = sess.panel_targets(mid)
+        dead = []
+        for p in targets:
+            try:
+                await p.send_text(txt)
+            except Exception:
+                dead.append(p)
+        for p in dead:
+            sess.panels.pop(p, None)
 
 
 # ═══════════════════════════════════════════════════════════
 #  UPSTREAM — Entity Sports push
 # ═══════════════════════════════════════════════════════════
-async def _dispatch_event(mid: str, out: dict):
-    """Push an event to every user watching this match."""
-    for sess in _watching_users(mid):
-        await sess.send_to_panels(out)
-        # Clicker needs the same event to drive Playwright
-        if sess.clicker is not None:
-            await sess.send_to_clicker(out)
-
-
-async def _dispatch_match(mid: str, out: dict):
-    """Push a full match object to every user watching."""
-    for sess in _watching_users(mid):
-        await sess.send_to_panels(out)
-
-
 def handle_upstream(raw):
-    """Sync parse + spawn async dispatch. Runs on ES WS thread."""
+    """Sync parse + async dispatch. Runs on ES WS thread."""
     try:
         msg = _decode(raw)
     except Exception:
@@ -468,12 +499,9 @@ def handle_upstream(raw):
     if not mid:
         return
 
-    # Update FIX cache
     if isinstance(mi0, dict) and mi0.get("match_id"):
-        FIX[mid] = fixture_row(mi0)
+        _lr_put(FIX, mid, fixture_row(mi0))
         _fix_pending.discard(mid)
-        if len(FIX) > MAX_CACHE:
-            FIX.pop(next(iter(FIX)), None)
     else:
         _ensure_fix(mid)
 
@@ -489,7 +517,7 @@ def handle_upstream(raw):
             "striker": d.get("striker_name"), "bowler": d.get("bowler_name"),
             "_server_ts": time.time() * 1000,
         }
-        asyncio.create_task(_dispatch_event(mid, out))
+        _schedule(_dispatch_event, mid, out)
         return
 
     # full match
@@ -497,10 +525,8 @@ def handle_upstream(raw):
         out = slim_match(msg, time.time())
         if not out["id"] or out["id"] != mid:
             return
-        LATEST_OBJ[mid] = out
-        if len(LATEST_OBJ) > MAX_CACHE:
-            LATEST_OBJ.pop(next(iter(LATEST_OBJ)), None)
-        asyncio.create_task(_dispatch_match(mid, out))
+        _lr_put(LATEST_OBJ, mid, out)
+        _schedule(_dispatch_match, mid, out)
 
 
 async def upstream_loop():
@@ -542,6 +568,8 @@ async def upstream_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _load_users()
+    if ALLOWED_ORIGINS == ["*"]:
+        log.warning("CORS allow_origins=['*'] — set ALLOWED_ORIGINS in production")
     tasks = []
     if PUSH_TOKEN:
         tasks.append(asyncio.create_task(upstream_loop()))
@@ -555,6 +583,10 @@ async def lifespan(app: FastAPI):
             await t
         except BaseException:
             pass
+    for t in list(_dispatch_tasks):
+        t.cancel()
+    if _dispatch_tasks:
+        await asyncio.gather(*_dispatch_tasks, return_exceptions=True)
     await client.aclose()
 
 
@@ -618,8 +650,17 @@ async def relay_ws(ws: WebSocket):
                     continue
                 t = m.get("type")
                 if t == "watch":
-                    sess.watching = (m.get("key") or "").strip()
-                    log.info("watch: user=%s... key=%s", token[:10], sess.watching or "(none)")
+                    sess.clicker_watch = (m.get("key") or "").strip()
+                    log.info("clicker watch: user=%s... key=%s",
+                             token[:10], sess.clicker_watch or "(none)")
+                    # fresh baseline for clicker
+                    if sess.clicker_watch:
+                        obj = _lr_get(LATEST_OBJ, sess.clicker_watch)
+                        if obj:
+                            try:
+                                await ws.send_text(_dumps(_fresh(obj)))
+                            except Exception:
+                                pass
                 elif t == "ping":
                     await ws.send_text("pong")
         except WebSocketDisconnect:
@@ -633,7 +674,7 @@ async def relay_ws(ws: WebSocket):
         return
 
     # ---------------- PANEL ----------------
-    sess.panels.add(ws)
+    sess.panels[ws] = ""
     log.info("panel connected: user=%s... (%d panels)", token[:10], len(sess.panels))
     try:
         while True:
@@ -643,9 +684,11 @@ async def relay_ws(ws: WebSocket):
                 continue
             if raw.startswith("watch:"):
                 new_key = raw[6:].strip()
-                sess.watching = new_key
+                sess.panels[ws] = new_key
                 log.info("watch: user=%s... key=%s", token[:10], new_key or "(none)")
-                # forward to clicker
+
+                # clicker follows latest panel watch
+                sess.clicker_watch = new_key
                 if sess.clicker:
                     try:
                         await sess.clicker.send_text(
@@ -653,49 +696,52 @@ async def relay_ws(ws: WebSocket):
                         )
                     except Exception:
                         pass
+
                 # baseline reply
                 if new_key:
-                    obj = LATEST_OBJ.get(new_key)
+                    obj = _lr_get(LATEST_OBJ, new_key)
                     if obj:
                         await ws.send_text(_dumps(_fresh(obj)))
                     else:
-                        asyncio.create_task(_send_baseline(ws, sess, new_key))
+                        _schedule(_send_baseline, ws, sess, new_key)
                 continue
     except WebSocketDisconnect:
         pass
     except Exception:
         pass
     finally:
-        sess.panels.discard(ws)
+        sess.panels.pop(ws, None)
         log.info("panel disconnected: user=%s... (%d panels left)", token[:10], len(sess.panels))
 
 
 async def _send_baseline(ws: WebSocket, sess: UserSession, mid: str):
-    """REST fetch for a match the panel just started watching."""
+    """REST fetch for a match this panel just started watching (cache-aware)."""
     if not REST_TOKEN:
         return
-    try:
-        r = await client.get(
-            f"{REST_BASE}/matches/{mid}/info",
-            params={"token": REST_TOKEN},
-        )
-        if not r.is_success:
-            return
-        resp = r.json().get("response") or {}
-        mi = resp.get("match_info") if isinstance(resp.get("match_info"), dict) else resp
-        if not isinstance(mi, dict) or not mi.get("match_id"):
-            return
-        obj = slim_match({"response": {"match_id": mid, "match_info": mi}}, time.time())
-        obj["id"] = str(mid)
-        LATEST_OBJ[mid] = obj
-        if sess.watching != mid:
-            return
+    obj = _lr_get(LATEST_OBJ, mid)
+    if obj is None:
         try:
-            await ws.send_text(_dumps(_fresh(obj)))
-        except Exception:
-            pass
-    except Exception as e:
-        log.warning("baseline fetch failed %s: %r", mid, e)
+            r = await client.get(f"{REST_BASE}/matches/{mid}/info", params={"token": REST_TOKEN})
+            if not r.is_success:
+                return
+            resp = r.json().get("response") or {}
+            mi = resp.get("match_info") if isinstance(resp.get("match_info"), dict) else resp
+            if not isinstance(mi, dict) or not mi.get("match_id"):
+                return
+            obj = slim_match({"response": {"match_id": mid, "match_info": mi}}, time.time())
+            obj["id"] = str(mid)
+            _lr_put(LATEST_OBJ, mid, obj)
+        except Exception as e:
+            log.warning("baseline fetch failed %s: %r", mid, e)
+            return
+
+    # only deliver if this panel is still watching the same match
+    if sess.panels.get(ws) != mid:
+        return
+    try:
+        await ws.send_text(_dumps(_fresh(obj)))
+    except Exception:
+        pass
 
 
 # ═══════════════════════════════════════════════════════════
@@ -731,17 +777,14 @@ async def api_match(match_key: str, authorization: str | None = Header(None)):
     _auth_header(authorization)
 
     # 1. cache
-    obj = LATEST_OBJ.get(match_key)
+    obj = _lr_get(LATEST_OBJ, match_key)
     if obj:
         return {"status": "ok", "data": _fresh(obj)}
 
     # 2. REST
     if REST_TOKEN:
         try:
-            r = await client.get(
-                f"{REST_BASE}/matches/{match_key}/info",
-                params={"token": REST_TOKEN},
-            )
+            r = await client.get(f"{REST_BASE}/matches/{match_key}/info", params={"token": REST_TOKEN})
             if r.is_success:
                 try:
                     resp = r.json().get("response") or {}
@@ -755,13 +798,13 @@ async def api_match(match_key: str, authorization: str | None = Header(None)):
                             time.time(),
                         )
                         obj["id"] = str(match_key)
-                        LATEST_OBJ[match_key] = obj
+                        _lr_put(LATEST_OBJ, match_key, obj)
                         return {"status": "ok", "data": _fresh(obj)}
         except Exception as e:
             log.warning("baseline %s err: %r", match_key, e)
 
     # 3. FIX fallback
-    fix = FIX.get(match_key)
+    fix = _lr_get(FIX, match_key)
     if fix:
         return {
             "status": "ok",
@@ -777,7 +820,6 @@ async def api_match(match_key: str, authorization: str | None = Header(None)):
             },
         }
 
-    # 4. nothing
     return JSONResponse(
         {"status": "error", "message": "match info not available"},
         status_code=404,
@@ -793,14 +835,14 @@ async def api_click(req: Request, authorization: str | None = Header(None)):
         body = {}
 
     sess = _sessions.get(user_key)
+    delivered = False
     if sess and sess.clicker:
         try:
-            await sess.clicker.send_text(
-                _dumps({"type": "manual_click", "payload": body})
-            )
+            await sess.clicker.send_text(_dumps({"type": "manual_click", "payload": body}))
+            delivered = True
         except Exception:
             pass
-    return {"status": "ok"}
+    return {"status": "ok", "delivered": delivered}
 
 
 # ═══════════════════════════════════════════════════════════
@@ -822,6 +864,7 @@ async def health():
         "users_online": len([s for s in _sessions.values() if s.panels or s.clicker]),
         "panels_total": sum(len(s.panels) for s in _sessions.values()),
         "clickers_total": sum(1 for s in _sessions.values() if s.clicker),
+        "dispatch_backlog": len(_dispatch_tasks),
     }
 
 
