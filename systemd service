@@ -1,1 +1,15 @@
+[Unit]
+Description=Cricket Panel Relay
+After=network.target
 
+[Service]
+Type=simple
+WorkingDirectory=/opt/relay
+EnvironmentFile=/opt/relay/.env
+ExecStart=/opt/relay/venv/bin/uvicorn relay_server:app --host 127.0.0.1 --port 8443 --log-level warning
+Restart=always
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target
