@@ -1,1 +1,4 @@
-
+{
+  "usr_a1b2c3d4e5": {"name": "Customer A", "expires": 1767225600, "created": 1735689600},
+  "usr_f6g7h8i9j0": {"name": "Customer B", "expires": 1767225600, "created": 1735689600}
+}
